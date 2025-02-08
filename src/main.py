@@ -60,6 +60,7 @@ async def get_author_assets(author_id: int):
             a = Assets(with_refresh(base_preston, character.token))
             await a.fetch()
             yield a
+
         for corporation_character in user.corporation_characters:
             try:
                 a = Assets(with_refresh(corp_base_preston, corporation_character.token))
@@ -85,6 +86,12 @@ def command_error_handler(func):
             await ctx.send(f"An error occurred in !{func.__name__}.")
 
     return wrapper
+
+
+def update_requirements(user):
+    if user.update_url is not None:
+        response = requests.get(user.update_url, allow_redirects=True)
+        user.requirements_file = response.text
 
 
 @bot.event
@@ -123,6 +130,19 @@ async def check(ctx):
     """Returns a bullet point list of what ships are missing things."""
 
     await ctx.send("Fetching assets...")
+
+    user = User.get_or_none(User.user_id == str(ctx.author.id))
+    if user is None:
+        await ctx.send("You are not a registered user!")
+        return
+
+    if user.update_url is not None:
+        update_requirements(user)
+
+    if user.requirements_file is None:
+        await ctx.send("You have not set a requirements file, use the !set command and upload one!")
+        return
+
     has_characters = False
     has_errors = False
     message = ""
@@ -133,30 +153,27 @@ async def check(ctx):
         else:
             name = f"\n## {assets.character_name}\n"
 
-        user = User.get_or_none(User.user_id == str(ctx.author.id))
-        if user and user.requirements_file:
-            for ship_error_message in assets.check_requirement(user.requirements_file):
-                has_errors = True
+        for ship_error_message in assets.check_requirement(user.requirements_file):
+            has_errors = True
 
-                if len(message) + len(ship_error_message) + len(name) > 1990:
-                    await ctx.send(message)
-                    message = ""
+            if len(message) + len(ship_error_message) + len(name) > 1990:
+                await ctx.send(message)
+                message = ""
 
-                if len(name) > 0:
-                    message += name
-                    name = ""
+            if len(name) > 0:
+                message += name
+                name = ""
 
-                message += f"{ship_error_message}\n"
-        else:
-            await ctx.send("You have not set a requirements file, use the !set command and upload one!")
+            message += f"{ship_error_message}\n"
 
-    if has_characters:
-        if has_errors:
-            await ctx.send(message)
-        else:
-            await ctx.send("**No State Errors found!**")
-    else:
+    if not has_characters:
         await ctx.send("You have no authorized characters!")
+        return
+
+    if has_errors:
+        await ctx.send(message)
+    else:
+        await ctx.send("**No State Errors found!**")
 
 
 @bot.command()
@@ -165,26 +182,35 @@ async def buy(ctx):
     """Returns a multibuy of all the things missing in your ships."""
 
     await ctx.send("Fetching assets...")
-    buy_list = collections.Counter()
+
+    user = User.get_or_none(User.user_id == str(ctx.author.id))
+    if user is None:
+        await ctx.send("You are not a registered user!")
+        return
+
+    if user.update_url is not None:
+        update_requirements(user)
+
+    if user.requirements_file is None:
+        await ctx.send("You have not set a requirements file, use the !set command and upload one!")
+        return
+
     has_characters = False
+    buy_list = collections.Counter()
     async for assets in get_author_assets(ctx.author.id):
         has_characters = True
+        buy_list = assets.get_buy_list(user.requirements_file, buy_list=buy_list)
 
-        # Get the user's requirements from the database
-        user = User.get_or_none(User.user_id == str(ctx.author.id))
-        if user and user.requirements_file:
-            buy_list = assets.get_buy_list(user.requirements_file, buy_list=buy_list)
-        else:
-            await ctx.send("You have not set a requirements file, use the !set command and upload one!")
+    if not has_characters:
+        await ctx.send("You have no authorized characters!")
+        return
 
     buy_list_body = "\n".join([f"{item} {amount}" for item, amount in buy_list.items()])
+
     if buy_list_body:
         await send_large_message(ctx, f"**Buy List:**\n```{buy_list_body}```")
     else:
-        if has_characters:
-            await ctx.send("**Nothing to buy!**")
-        else:
-            await ctx.send("You have no authorized characters!")
+        await ctx.send("**Nothing to buy!**")
 
 
 @bot.command()
@@ -192,21 +218,25 @@ async def buy(ctx):
 async def set(ctx, attachment: discord.Attachment):
     """Sets your current requirement file to the one attached to this command."""
 
-    if attachment:
-        response = requests.get(attachment.url, allow_redirects=True)
-        requirements_content = response.content.decode('utf-8')  # Decode the content to a string
-
-        # Upsert the user's requirements file into the database
-        user = User.get_or_none(user_id=str(ctx.author.id))
-        if user:
-            user.requirements_file = requirements_content
-            user.save()
-            await ctx.send("Set new requirements file!")
-        else:
-            await ctx.send("You currently have no linked characters, so having requirements makes no sense.")
-
-    else:
+    if not attachment:
         await ctx.send("You forgot to attach a new requirement file!")
+        return
+
+    response = requests.get(attachment.url, allow_redirects=True)
+    requirements_content = response.content.decode('utf-8')  # Decode the content to a string
+
+    user = User.get_or_none(user_id=str(ctx.author.id))
+    if user is None:
+        await ctx.send("You currently have no linked characters, so having requirements makes no sense.")
+        return
+
+    if user.update_url:
+        await ctx.send("Setting a requirements file doesn't make sense as you have an update-url. Unset that first.")
+        return
+
+    user.requirements_file = requirements_content
+    user.save()
+    await ctx.send("Set new requirements file!")
 
 
 @bot.command()
@@ -215,12 +245,23 @@ async def get(ctx):
     """Returns your current requirements."""
 
     user = User.get_or_none(User.user_id == str(ctx.author.id))
-    if user and user.requirements_file:
-        requirements = discord.File(fp=BytesIO(user.requirements_file.encode('utf-8')),
-                                    filename="requirements.yaml")
-        await ctx.send("Here is your current requirement file.", file=requirements)
-    else:
-        await ctx.send("You don't have a requirements file set.")
+    if user is None:
+        await ctx.send("You are not a registered user!")
+        return
+
+    if user.update_url is not None:
+        update_requirements(user)
+
+    if user.requirements_file is None:
+        await ctx.send("You have not set a requirements file, use the !set command and upload one!")
+        return
+
+    requirements = discord.File(
+        fp=BytesIO(user.requirements_file.encode('utf-8')),
+        filename="requirements.yaml"
+    )
+
+    await ctx.send("Here is your current requirement file.", file=requirements)
 
 
 @bot.command()
@@ -252,18 +293,21 @@ async def characters(ctx):
 
     character_names = []
     user = User.get_or_none(User.user_id == str(ctx.author.id))
-    if user:
-        for character in user.characters:
-            char_auth = with_refresh(base_preston, character.token)
-            character_name = char_auth.whoami()['CharacterName']
-            character_names.append(f"- {character_name}")
+    if user is None:
+        await ctx.send("You are not a registered user!")
+        return
 
-        for corporation_character in user.corporation_characters:
-            char_auth = with_refresh(corp_base_preston, corporation_character.token)
-            character_name = char_auth.whoami()['CharacterName']
-            corporation_name = char_auth.get_op("get_corporations_corporation_id",
-                                                corporation_id=corporation_character.corporation_id).get("name")
-            character_names.append(f"- {corporation_name} (via {character_name})")
+    for character in user.characters:
+        char_auth = with_refresh(base_preston, character.token)
+        character_name = char_auth.whoami()['CharacterName']
+        character_names.append(f"- {character_name}")
+
+    for corporation_character in user.corporation_characters:
+        char_auth = with_refresh(corp_base_preston, corporation_character.token)
+        character_name = char_auth.whoami()['CharacterName']
+        corporation_name = char_auth.get_op("get_corporations_corporation_id",
+                                            corporation_id=corporation_character.corporation_id).get("name")
+        character_names.append(f"- {corporation_name} (via {character_name})")
 
     if character_names:
         character_names_body = "\n".join(character_names)
@@ -324,6 +368,20 @@ async def revoke(ctx, *args):
     except ValueError:
         args_concatenated = " ".join(args)
         await ctx.send(f"Args `{args_concatenated}` could not be parsed or looked up.")
+
+
+@bot.command()
+@command_error_handler
+async def url(ctx, url=None):
+    """Set an url from which to update your requirements file before other actions."""
+    # Upsert the user's requirements file into the database
+    user = User.get_or_none(user_id=str(ctx.author.id))
+    if user:
+        user.update_url = url
+        user.save()
+        await ctx.send("Set new update url!")
+    else:
+        await ctx.send("You currently have no linked characters, so having an update url makes no sense.")
 
 
 if __name__ == "__main__":
